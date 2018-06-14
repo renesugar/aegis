@@ -1,8 +1,23 @@
+// Copyright © 2016 Tom Maiaroto <tom@SerifAndSemaphore.io>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package framework
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 
 	"github.com/aws/aws-lambda-go/lambda"
@@ -17,13 +32,18 @@ type RPCRouter struct {
 	Tracer   TraceStrategy
 }
 
-// RPCHandler is similar to RPCHanlder
-type RPCHandler func(context.Context, *map[string]interface{}) (map[string]interface{}, error)
+// RPCHandler is similar to and other router/handler but it returns a map[string]interface{} in addition to an error
+type RPCHandler func(context.Context, *HandlerDependencies, map[string]interface{}) (map[string]interface{}, error)
 
 // LambdaHandler is a native AWS Lambda Go handler function. Handles a remote procedure call (invocation via SDK with a special event format).
-func (r *RPCRouter) LambdaHandler(ctx context.Context, evt map[string]interface{}) (map[string]interface{}, error) {
+func (r *RPCRouter) LambdaHandler(ctx context.Context, d *HandlerDependencies, evt map[string]interface{}) (map[string]interface{}, error) {
 	var err error
 	var response map[string]interface{}
+	// If an incoming event can be matched to this router, but the router has no registered handlers
+	// or if one hasn't been added to aegis.Handlers{}.
+	if r == nil {
+		return response, errors.New("no handlers registered for RPCRouter")
+	}
 
 	handled := false
 	procedureName := ""
@@ -38,13 +58,20 @@ func (r *RPCRouter) LambdaHandler(ctx context.Context, evt map[string]interface{
 			// Trace (default is to use XRay)
 			// Annotations can be searched in XRay.
 			// For example: annotation.RPCName = "myProcedure"
-			r.Tracer.Annotations = map[string]interface{}{
-				"RPCName": procedureName,
-			}
+			// r.Tracer.Annotations = map[string]interface{}{
+			// 	"RPCName": procedureName,
+			// }
+			r.Tracer.Record("annotation",
+				map[string]interface{}{
+					"RPCName": procedureName,
+				},
+			)
+
 			err = r.Tracer.Capture(ctx, "RPCHandler", func(ctx1 context.Context) error {
-				r.Tracer.AddAnnotations(ctx1)
-				r.Tracer.AddMetadata(ctx1)
-				response, err = handler(ctx, &evt)
+				// r.Tracer.AddAnnotations(ctx1)
+				// r.Tracer.AddMetadata(ctx1)
+				d.Tracer = &r.Tracer
+				response, err = handler(ctx1, d, evt)
 				return err
 			})
 		}
@@ -53,16 +80,24 @@ func (r *RPCRouter) LambdaHandler(ctx context.Context, evt map[string]interface{
 		// This is optional.
 		if !handled {
 			// It's possible that the RPCRouter wasn't created with NewRPCRouter, so check for this still.
-			if handler, ok := r.handlers["*"]; ok {
+			if handler, ok := r.handlers["_"]; ok {
 				// Capture the handler (in XRay by default) automatically
-				r.Tracer.Annotations = map[string]interface{}{
-					"RPCName":            procedureName,
-					"FallthroughHandler": true,
-				}
+				// r.Tracer.Annotations = map[string]interface{}{
+				// 	"RPCName":            procedureName,
+				// 	"FallthroughHandler": true,
+				// }
+				r.Tracer.Record("annotation",
+					map[string]interface{}{
+						"RPCName":            procedureName,
+						"FallthroughHandler": true,
+					},
+				)
+
 				err = r.Tracer.Capture(ctx, "RPCHandler", func(ctx1 context.Context) error {
-					r.Tracer.AddAnnotations(ctx1)
-					r.Tracer.AddMetadata(ctx1)
-					response, err = handler(ctx, &evt)
+					// r.Tracer.AddAnnotations(ctx1)
+					// r.Tracer.AddMetadata(ctx1)
+					d.Tracer = &r.Tracer
+					response, err = handler(ctx1, d, evt)
 					return err
 				})
 			}
@@ -80,7 +115,7 @@ func (r *RPCRouter) Listen() {
 // NewRPCRouter simply returns a new RPCRouter struct and behaves a bit like Router, it even takes an optional rootHandler or "fall through" catch all
 func NewRPCRouter(rootHandler ...RPCHandler) *RPCRouter {
 	// The catch all is optional, if not provided, an empty handler is still called and it returns nothing.
-	handler := func(context.Context, *map[string]interface{}) (map[string]interface{}, error) {
+	handler := func(context.Context, *HandlerDependencies, map[string]interface{}) (map[string]interface{}, error) {
 		return map[string]interface{}{}, nil
 	}
 	if len(rootHandler) > 0 {
@@ -88,7 +123,7 @@ func NewRPCRouter(rootHandler ...RPCHandler) *RPCRouter {
 	}
 	return &RPCRouter{
 		handlers: map[string]RPCHandler{
-			"*": handler,
+			"_": handler,
 		},
 	}
 }
@@ -102,7 +137,7 @@ func (r *RPCRouter) Handle(name string, handler RPCHandler) {
 }
 
 // RPC will make the remote procedure call (invoke another lambda)
-func RPC(ctx context.Context, functionName string, message map[string]interface{}) (map[string]interface{}, error) {
+func RPC(functionName string, message map[string]interface{}) (map[string]interface{}, error) {
 	sess, err := session.NewSession()
 	if err != nil {
 		log.Println("could not make remote procedure call, session could not be created")
@@ -118,15 +153,7 @@ func RPC(ctx context.Context, functionName string, message map[string]interface{
 
 	// region? cross account?
 	svc := lambdaSDK.New(sess)
-	// Wrap in XRay so it gets logged and appears in service map
-	// TODO: We don't hav r *RPCRouter here...So we don't have a configurable interface to use...
-	// TraceStrategy.AWS()
-	// xray.AWS(svc.Client)
-	AWSClientTracer(svc.Client)
-
-	// TODO: Look into this more. So many interesting options here. InvocationType and LogType could be interesting outside of defaults
-	output, err := svc.InvokeWithContext(ctx, &lambdaSDK.InvokeInput{
-		// ClientContext // TODO: think about this...
+	output, err := svc.Invoke(&lambdaSDK.InvokeInput{
 		FunctionName: aws.String(functionName),
 		// JSON bytes, sadly it does not pass just any old byte array. It's going to come in as a map to the handler.
 		// That's a map[string]interface{} from JSON. I saw byte array at first and got excited.
